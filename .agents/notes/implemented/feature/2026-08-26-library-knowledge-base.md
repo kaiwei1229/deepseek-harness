@@ -23,6 +23,12 @@ A new `packages/library/` capability family plus a browser surface, all additive
 - A conversation.view tab (the ui-writing shape): rejected — the spec requires upload and browsing without entering a chat, and conversation.view is session-scoped.
 - Ingest-time persistent index (FTS5/vector): deferred — query-time scoring is enough for demo-scale corpora and keeps the seam open for `session-query`-style backends.
 
+## Consequences
+
+- Every composition mounting the base bundle gains four `library_*` tool schemas in each agent's assembly and a `librarian` subagent provider; presets that do not want the Library must filter them.
+- Documents exist twice on disk (original + Markdown twin), so storage costs roughly double per upload; conversion quality bounds what agents can read.
+- `ui-sidebar` carries a new public `sidebar.section` hole other plugins may occupy; its contract is now load-bearing beyond the Library.
+
 ## Verification
 
 - 26 unit tests over chunking/scoring, the built-in converter, `safeFileName`, and the librarian service on the real storage hub/domain/JSON backend (temp `dshHome`).
