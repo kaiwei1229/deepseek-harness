@@ -1,6 +1,8 @@
 # @deepseek-ai/dsh-library-api
 
-Browser-facing library gateway (`ctx.library`): the `library` Remote namespace (`ctx.remote.library.*` in the client) projecting the librarian service into a plain JSON wire contract — notebook CRUD, resource listing and deletion, pasted-text ingest, Markdown preview payloads, and grounded `ask` — plus the `/library` binary data plane the JSON-only `/api` gateway cannot carry: `POST /library/upload?notebook=&name=&kind=` admits one raw request body (byte-capped by `maxUploadBytes`), `GET /library/<resourceId>/raw` streams the stored original inline (the PDF/text preview `iframe` source), and `GET /library/<resourceId>/download` streams it as an attachment. Every data-plane request re-authenticates through `ctx.auth` when an auth service is mounted; the route registers only when a `webServer` is composed.
+English | [简体中文](README.zh.md) | [繁體中文](README.zh-tw.md)
+
+Browser-facing library gateway (`ctx.library`): the `library` Remote namespace (`ctx.remote.library.*` in the client) projecting the librarian service into a plain JSON wire contract — notebook CRUD, resource listing and deletion, pasted-text ingest, Markdown preview payloads, grounded `ask`, and the notebook's durable `askLog` history — plus the `/library` binary data plane the JSON-only `/api` gateway cannot carry: `POST /library/upload?notebook=&name=&kind=` admits one raw request body (byte-capped by `maxUploadBytes`), `GET /library/<resourceId>/raw` streams the stored original inline (the PDF/text preview `iframe` source), and `GET /library/<resourceId>/download` streams it as an attachment. Every data-plane request re-authenticates through `ctx.auth` when an auth service is mounted; the route registers only when a `webServer` is composed.
 
 ## Model Experience
 

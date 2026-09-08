@@ -5,16 +5,24 @@
  * plane — the components hold view-local state only.
  */
 import type { HostObservable } from '@deepseek-ai/dsh-client-ui-slots'
-import type { AskView, NotebookView, ResourceView } from '@deepseek-ai/dsh-library-api/types'
+import type { AskLogEntryView, AskView, NotebookView, ResourceView } from '@deepseek-ai/dsh-library-api/types'
 
-export type { AskView, NotebookView, ResourceView } from '@deepseek-ai/dsh-library-api/types'
+export type { AskLogEntryView, AskView, NotebookView, ResourceView } from '@deepseek-ai/dsh-library-api/types'
 
-/** Whether the Library page is open and which notebook it shows. */
+/**
+ * Whether the Library page is open, which notebook it shows, and which
+ * resource its preview panel holds. The whole triple is shared state (not
+ * view-local) because it doubles as the page's address: the plugin mirrors it
+ * into the `#library/…` URL hash, so documents and the ask thread are
+ * linkable from outside the page.
+ */
 export interface LibraryPageState {
   /** Whether the full-page view renders. */
   readonly open: boolean
   /** Selected notebook id; `undefined` before the first selection. */
   readonly notebookId?: string
+  /** Resource open in the preview panel; `undefined` keeps the panel closed. */
+  readonly resourceId?: string
 }
 
 /** Shared observables of the Library surface. */
@@ -49,8 +57,10 @@ export interface LibrarySectionFace extends LibraryHooks {
 export interface LibraryViewFace extends LibraryHooks {
   /** Close the Library page. */
   onClose(): void
-  /** Switch the page to one notebook. */
+  /** Switch the page to one notebook (closing any open preview). */
   onSelectNotebook(notebookId: string): void
+  /** Open one resource in the preview panel, or close it with `undefined`. */
+  onOpenResource(resourceId: string | undefined): void
   /** List notebooks, newest first. */
   listNotebooks(): Promise<readonly NotebookView[]>
   /** Create a notebook and select it. */
@@ -71,6 +81,8 @@ export interface LibraryViewFace extends LibraryHooks {
   readMarkdown(resourceId: string): Promise<string>
   /** Ask the notebook a question; resolves to the grounded answer. */
   ask(notebookId: string, question: string): Promise<AskView>
+  /** Read one notebook's durable ask history, oldest first. */
+  askLog(notebookId: string): Promise<readonly AskLogEntryView[]>
   /**
    * Same-origin URL of one resource's stored original.
    * @param resourceId - Resource id.

@@ -17,6 +17,7 @@ import type { AskResult, Notebook, Resource } from '@deepseek-ai/dsh-library'
 import type {} from '@deepseek-ai/dsh-host-webserver'
 import type {} from '@deepseek-ai/dsh-auth'
 import type {
+  AskLogEntryView,
   AskRequest,
   AskView,
   CreateNotebookRequest,
@@ -181,6 +182,29 @@ export class LibraryGateway extends TypertRemoteService {
     return askView(await this.ctx.librarian.ask(NotebookId(request.notebookId), request.question, signal))
   }
 
+  /**
+   * One notebook's durable ask history, oldest first — the Library page's
+   * persistent thread, including exchanges agents asked from the chat.
+   * @param request - notebook id.
+   * @returns recorded exchanges.
+   */
+  @Remote('askLog')
+  async askLog(request: NotebookRequest): Promise<AskLogEntryView[]> {
+    return (await this.ctx.librarian.askLog(NotebookId(request.notebookId))).map(entry => ({
+      id: entry.id,
+      origin: entry.origin,
+      question: entry.question,
+      answer: entry.answer,
+      grounded: entry.grounded,
+      sources: entry.sources.map(source => ({
+        resourceId: String(source.resourceId),
+        name: source.name,
+        heading: source.heading,
+      })),
+      createdAt: entry.createdAt,
+    }))
+  }
+
   /** Dispatch one `/library` data-plane request. */
   private async serve(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const user = await this.authOf(req)
@@ -273,7 +297,7 @@ export class LibraryGateway extends TypertRemoteService {
     createReadStream(original.path).pipe(res)
   }
 
-  private async authOf(req: IncomingMessage): Promise<unknown | undefined> {
+  private async authOf(req: IncomingMessage): Promise<unknown> {
     const auth = this.ctx.get('auth')
     if (auth === undefined) return { userId: 'anonymous', username: 'anonymous' }
     return await auth.authenticateRequest(req)

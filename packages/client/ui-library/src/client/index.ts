@@ -3,7 +3,9 @@
  * notebook list below the session browser) and one `shell.overlay` entry (the
  * full-page Library view). The two share a closure-scoped page-state
  * observable and a revision counter bumped after every mutation; durable data
- * travels through `ctx.remote.library` and the `/library` data plane.
+ * travels through `ctx.remote.library` and the `/library` data plane. The
+ * page state mirrors into the `#library/…` URL hash both ways, so notebooks,
+ * documents, and the ask thread are linkable from outside the page.
  */
 import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
 // Type-only: pulls the generated Remote API and ctx.remote merge through the Client assembly boundary.
@@ -60,6 +62,33 @@ function valueSource<T>(initial: T): ValueSource<T> {
 /** Required services: the two slot seats, Remote mutations, and copy. */
 export const inject = ['slots', 'locale', 'remote', 'remote.library']
 
+/** The Library page's URL-hash address: `#library/<notebook>[/resource/<id>]`. */
+const HASH_RE = /^#library(?:\/([^/]+))?(?:\/resource\/([^/]+))?$/
+
+/** Parse the current location hash into a page state, or `undefined` when it is not a Library address. */
+export function stateFromHash(hash: string): LibraryPageState | undefined {
+  const match = HASH_RE.exec(hash)
+  if (match === null) return undefined
+  const notebookId = match[1] === undefined ? undefined : decodeURIComponent(match[1])
+  const resourceId = match[2] === undefined ? undefined : decodeURIComponent(match[2])
+  return {
+    open: true,
+    ...notebookId === undefined ? {} : { notebookId },
+    ...notebookId === undefined || resourceId === undefined ? {} : { resourceId },
+  }
+}
+
+/** Project one page state to its hash address; `''` for a closed page. */
+export function hashFromState(state: LibraryPageState): string {
+  if (!state.open) return ''
+  let hash = '#library'
+  if (state.notebookId !== undefined) {
+    hash += `/${encodeURIComponent(state.notebookId)}`
+    if (state.resourceId !== undefined) hash += `/resource/${encodeURIComponent(state.resourceId)}`
+  }
+  return hash
+}
+
 /**
  * Register the Library surface. The inject faces wrap the Remote calls,
  * branching on `ok`, and bump the shared revision after every mutation.
@@ -72,6 +101,35 @@ export function apply(ctx: ClientContext): void {
   const revision = valueSource(0)
   const sidebarEdge = valueSource(0)
   const bump = () => { revision.set(revision.getSnapshot() + 1) }
+
+  // Deep links: the page state mirrors into the `#library/…` hash, so a
+  // document or the ask thread is reachable from outside the page (a pasted
+  // URL, a link an agent wrote in chat). The hash is applied at boot and on
+  // every later hashchange; state changes rewrite the hash without growing
+  // the history.
+  ctx.effect(() => {
+    const applyHash = (): void => {
+      const next = stateFromHash(window.location.hash)
+      if (next !== undefined) {
+        pageState.set(next)
+      } else if (pageState.getSnapshot().open && window.location.hash === '') {
+        pageState.set({ ...pageState.getSnapshot(), open: false })
+      }
+    }
+    const syncHash = (): void => {
+      const wanted = hashFromState(pageState.getSnapshot())
+      if (wanted === window.location.hash) return
+      const base = window.location.pathname + window.location.search
+      window.history.replaceState(null, '', wanted === '' ? base : base + wanted)
+    }
+    applyHash()
+    const unsubscribe = pageState.subscribe(syncHash)
+    window.addEventListener('hashchange', applyHash)
+    return () => {
+      unsubscribe()
+      window.removeEventListener('hashchange', applyHash)
+    }
+  }, 'ui-library: hash deep links')
 
   const unwrap = <T>(result: { ok: true; value: T } | { ok: false; error: { code: string; message: string } }): T => {
     if (!result.ok) throw new Error(`${result.error.code}: ${result.error.message}`)
@@ -129,7 +187,16 @@ export function apply(ctx: ClientContext): void {
         pageState.set({ ...pageState.getSnapshot(), open: false })
       },
       onSelectNotebook: (notebookId) => {
+        // A notebook switch drops the open preview: the resource belongs to
+        // the previous notebook.
         pageState.set({ open: true, notebookId })
+      },
+      onOpenResource: (resourceId) => {
+        const current = pageState.getSnapshot()
+        if (current.notebookId === undefined) return
+        pageState.set(resourceId === undefined
+          ? { open: current.open, notebookId: current.notebookId }
+          : { open: current.open, notebookId: current.notebookId, resourceId })
       },
       listNotebooks,
       createNotebook: async (title) => {
@@ -160,6 +227,7 @@ export function apply(ctx: ClientContext): void {
       uploadFile,
       readMarkdown: async resourceId => unwrap(await ctx.remote.library.readMarkdown({ resourceId })).content,
       ask: async (notebookId, question) => unwrap(await ctx.remote.library.ask({ notebookId, question })),
+      askLog: async notebookId => unwrap(await ctx.remote.library.askLog({ notebookId })),
       fileUrl: (resourceId, variant) => `/library/${encodeURIComponent(resourceId)}/${variant}`,
     }),
   }, LibraryView))

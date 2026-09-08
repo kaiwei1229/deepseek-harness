@@ -115,3 +115,21 @@ export interface AskView {
   /** Whether any grounding excerpt was found (`false` answers decline). */
   readonly grounded: boolean
 }
+
+/** One recorded ask exchange of a notebook's durable history. */
+export interface AskLogEntryView {
+  /** Entry id. */
+  readonly id: string
+  /** Who asked: `ui` (the Library page) or `agent` (a chat tool call). */
+  readonly origin: string
+  /** The question as asked. */
+  readonly question: string
+  /** The answer text. */
+  readonly answer: string
+  /** Whether the answer was grounded in stored content. */
+  readonly grounded: boolean
+  /** Cited sources behind the answer. */
+  readonly sources: readonly AskSourceView[]
+  /** ISO-8601 instant the exchange settled. */
+  readonly createdAt: string
+}
