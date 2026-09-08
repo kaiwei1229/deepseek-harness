@@ -121,6 +121,32 @@ export interface ResourceStructure {
   readonly status: ResourceStatus
   /** Leading Markdown headings of the converted document (empty until `ready`). */
   readonly outline: readonly string[]
+  /** Leading plain-text excerpt of the converted document (empty until `ready`). */
+  readonly summary: string
+}
+
+/** Who asked one recorded Library question. */
+export const ASK_ORIGINS = ['ui', 'agent'] as const
+
+/** One of {@link ASK_ORIGINS}: the Library page composer, or an agent tool call. */
+export type AskOrigin = (typeof ASK_ORIGINS)[number]
+
+/** One asked-and-answered exchange kept in a notebook's durable ask log. */
+export interface AskLogEntry {
+  /** Entry id. */
+  readonly id: string
+  /** Who asked; see {@link ASK_ORIGINS}. */
+  readonly origin: AskOrigin
+  /** The question as asked. */
+  readonly question: string
+  /** The answer text. */
+  readonly answer: string
+  /** Whether the answer was grounded in stored content. */
+  readonly grounded: boolean
+  /** Cited sources behind the answer. */
+  readonly sources: readonly AskSource[]
+  /** ISO-8601 instant the exchange settled. */
+  readonly createdAt: string
 }
 
 /** Structure listing of one notebook. */

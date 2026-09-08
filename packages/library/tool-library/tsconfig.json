@@ -24,6 +24,12 @@
       "path": "../../core/tools"
     },
     {
+      "path": "../../llm/llm"
+    },
+    {
+      "path": "../../subagent/subagent"
+    },
+    {
       "path": "../../runtime-diagnostics/invariants"
     }
   ]

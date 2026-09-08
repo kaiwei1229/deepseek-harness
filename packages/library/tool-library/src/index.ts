@@ -1,9 +1,13 @@
 /**
- * Model-facing librarian tools over the Library knowledge base. `library_ask`
- * is the primary interaction — question in, grounded cited answer out —
- * mirroring the DeepWiki MCP face (`ask_question` first, structure and
- * content reads second); `library_ingest` lets an agent file documents into a
- * notebook through the same entry point the UI upload uses.
+ * Model-facing librarian tools over the Library knowledge base, mirroring the
+ * DeepWiki MCP face: `library_ask` is the primary interaction — question in,
+ * grounded cited answer out — with `library_structure` and `library_read` as
+ * the direct navigation and content reads beside it, and `library_ingest` as
+ * the programmatic write entry the UI upload shares. Asking delegates to the
+ * `librarian` subagent when one is mounted (the issue-#23 workflow: the child
+ * navigates the notebook with structure/read and answers with citations);
+ * without a subagent runtime the service's direct retrieval-and-answer route
+ * answers instead. Both routes land in the notebook's ask log.
  * @module @deepseek-ai/dsh-tool-library
  */
 
@@ -11,14 +15,22 @@ import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { createConverter } from 'zhtw-js'
 import { defineTool } from '@deepseek-ai/dsh-tools'
+import type { ToolRunContext } from '@deepseek-ai/dsh-tools'
 import { ResourceId } from '@deepseek-ai/dsh-library'
-import type { Notebook } from '@deepseek-ai/dsh-library'
+import type { AskResult, AskSource, Notebook } from '@deepseek-ai/dsh-library'
+import type { ContentBlock } from '@deepseek-ai/dsh-llm'
+// Type-only: resolves ctx.get('subagents') for the librarian delegation route.
+import type {} from '@deepseek-ai/dsh-subagent'
+import type { SubagentRun } from '@deepseek-ai/dsh-subagent'
 
 export type {} from '@deepseek-ai/dsh-library'
 
 export const name = 'tool-library'
 
 export const inject = ['tools', 'librarian']
+
+/** The subagent provider name `library_ask` delegates to when mounted. */
+export const LIBRARIAN_PROVIDER = 'librarian'
 
 /** Model-facing output bounds, all changeable from cordis.yml. */
 export interface Config {
@@ -47,7 +59,7 @@ export function apply(ctx: Context, config: Config): void {
       'Ask the Library (the research knowledge base) a question and get an answer grounded in '
       + 'the stored documents, with inline [source] citations. This is the primary way to use '
       + 'the knowledge base — prefer one good question over reading files one by one. '
-      + 'Overview questions answer from each document\'s leading content; only an empty '
+      + 'The question is answered by the librarian agent reading the notebook; only an empty '
       + 'notebook declines.',
     parameters: {
       notebook: { type: 'string', required: true, description: NOTEBOOK_REF },
@@ -78,7 +90,9 @@ export function apply(ctx: Context, config: Config): void {
     },
     execute: async (args, exec) => {
       const notebook = resolveNotebook(ctx, args.notebook)
-      const result = await ctx.librarian.ask(notebook.id, args.question, exec.signal)
+      const delegated = await askViaLibrarian(ctx, notebook, args.question, exec)
+      const result = delegated
+        ?? await ctx.librarian.ask(notebook.id, args.question, exec.signal, 'agent')
       return {
         answer: result.answer,
         grounded: result.grounded,
@@ -91,9 +105,9 @@ export function apply(ctx: Context, config: Config): void {
   ctx.tools.register(defineTool({
     name: 'library_structure',
     description:
-      'List the Library structure: every notebook (id and title) with its resources and their '
-      + 'leading Markdown headings. Use this to discover what the knowledge base holds before '
-      + 'asking or reading.',
+      'List the Library structure: every notebook (id and title) with its resources, their '
+      + 'leading Markdown headings, and a leading excerpt — served from the ingest-time index. '
+      + 'Use this to discover what the knowledge base holds before asking or reading.',
     parameters: {
       notebook: { type: 'string', description: `Restrict to one notebook. ${NOTEBOOK_REF}` },
     },
@@ -123,6 +137,7 @@ export function apply(ctx: Context, config: Config): void {
                       kind: { type: 'string', required: true },
                       status: { type: 'string', required: true },
                       outline: { type: 'array', required: true, items: { type: 'string' } },
+                      summary: { type: 'string', required: true },
                     },
                   },
                 },
@@ -146,6 +161,7 @@ export function apply(ctx: Context, config: Config): void {
             kind: resource.kind,
             status: resource.status,
             outline: [...resource.outline],
+            summary: resource.summary,
           })),
         })),
       }
@@ -240,6 +256,77 @@ export function apply(ctx: Context, config: Config): void {
   }))
 }
 
+/**
+ * Answer one question through the `librarian` subagent — the issue-#23
+ * `ask_question` workflow: a fresh librarian child navigates the notebook
+ * with `library_structure` and `library_read` (asking and filing are filtered
+ * out so a child never recurses into this tool) and answers with inline
+ * [name] citations. Sources are recovered from those citations against the
+ * notebook's resource names, and the exchange lands in the notebook's ask
+ * log as an agent entry.
+ * @param ctx - registrant context.
+ * @param notebook - resolved target notebook.
+ * @param question - the question as asked.
+ * @param exec - the tool execution (calling agent + cancellation).
+ * @returns the answer, or `undefined` when no delegation route exists
+ *   (no subagent runtime, no `librarian` provider, or a non-agent caller).
+ */
+async function askViaLibrarian(
+  ctx: Context,
+  notebook: Notebook,
+  question: string,
+  exec: ToolRunContext,
+): Promise<AskResult | undefined> {
+  const subagents = ctx.get('subagents')
+  const parent = exec.agent
+  if (subagents === undefined || parent === undefined) return undefined
+  if (subagents.getProvider(LIBRARIAN_PROVIDER) === undefined) return undefined
+  const prompt: ContentBlock[] = [{
+    type: 'text',
+    text:
+      `Answer one question from the Library notebook "${notebook.title}" (notebook id ${notebook.id}).\n\n`
+      + `Question: ${question}\n\n`
+      + 'Ground yourself in this notebook only: call library_structure with the notebook id to see its '
+      + 'resources, outlines, and summaries, read the relevant resources with library_read, then answer '
+      + 'the question in the question\'s language. Cite the documents you used inline as [name] after each '
+      + 'claim, exactly matching their resource names. When the notebook does not contain the answer, say '
+      + 'so plainly instead of guessing.',
+  }]
+  const run: SubagentRun = await subagents.start(LIBRARIAN_PROVIDER, {
+    label: `Library ask: ${question.length > 60 ? `${question.slice(0, 60)}…` : question}`,
+    prompt,
+    parent,
+    signal: exec.signal,
+    toolFilter: { deny: ['library_ask', 'library_ingest'] },
+  })
+  // Collect, then dispose — a disposal failure must not mask the result.
+  const [execution] = await Promise.allSettled([run.result])
+  const [disposal] = await Promise.allSettled([Promise.resolve().then(() => run.dispose())])
+  if (execution.status === 'rejected') throw execution.reason
+  if (disposal.status === 'rejected') throw disposal.reason
+  const result = execution.value
+  if (result.stopReason !== 'completed') {
+    throw new Error(`librarian subagent ended with '${result.stopReason}' instead of an answer`)
+  }
+  const answer = result.output
+    .filter((block): block is Extract<ContentBlock, { type: 'text' }> => block.type === 'text')
+    .map(block => block.text)
+    .join('\n')
+    .trim()
+  if (answer === '') throw new Error('librarian subagent finished without an answer')
+  const sources = citedSources(ctx, notebook, answer)
+  const recorded: AskResult = { answer, grounded: true, sources }
+  await ctx.librarian.recordAsk(notebook.id, { origin: 'agent', question, ...recorded })
+  return recorded
+}
+
+/** Recover cited sources from inline [name] citations against the notebook's resources. */
+function citedSources(ctx: Context, notebook: Notebook, answer: string): AskSource[] {
+  return ctx.librarian.listResources(notebook.id)
+    .filter(resource => answer.includes(`[${resource.name}]`))
+    .map(resource => ({ resourceId: resource.id, name: resource.name, heading: '' }))
+}
+
 const titleConverter = createConverter()
 
 /**
@@ -278,7 +365,7 @@ function askText(value: { answer: string; grounded: boolean; sources: { name: st
 function structureText(notebooks: {
   notebookId: string
   title: string
-  resources: { resourceId: string; name: string; kind: string; status: string; outline: string[] }[]
+  resources: { resourceId: string; name: string; kind: string; status: string; outline: string[]; summary: string }[]
 }[]): string {
   if (notebooks.length === 0) return 'The library has no notebooks yet.'
   return notebooks.map((notebook) => {
@@ -286,7 +373,8 @@ function structureText(notebooks: {
       ? '  (empty)'
       : notebook.resources.map((resource) => {
         const outline = resource.outline.length === 0 ? '' : `\n      ${resource.outline.join(' · ')}`
-        return `  - ${resource.name} [${resource.kind}, ${resource.status}] (${resource.resourceId})${outline}`
+        const summary = resource.summary === '' ? '' : `\n      ${resource.summary}`
+        return `  - ${resource.name} [${resource.kind}, ${resource.status}] (${resource.resourceId})${outline}${summary}`
       }).join('\n')
     return `${notebook.title} (${notebook.notebookId})\n${resources}`
   }).join('\n\n')

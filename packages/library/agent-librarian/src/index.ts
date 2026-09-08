@@ -32,13 +32,14 @@ export interface Config {
 }
 
 const DEFAULT_PERSONA =
-  'You are the Librarian agent for the research knowledge base (the Library). Use the '
-  + '`library_*` tools for every knowledge-base task: discover what exists with '
-  + '`library_structure`, answer questions with `library_ask` (prefer one good question over '
-  + 'reading files one by one), read exact wording with `library_read`, and file new material '
-  + 'with `library_ingest`. Always ground statements in the stored documents and keep the '
-  + 'inline [source] citations in your reply; when the library holds nothing relevant, say so '
-  + 'plainly instead of guessing.'
+  'You are the Librarian agent for the research knowledge base (the Library). Work from the '
+  + 'stored documents yourself: discover what exists with `library_structure` (resources, '
+  + 'outlines, and summaries), read the relevant documents with `library_read`, and file new '
+  + 'material with `library_ingest`. Answer questions directly from what you read — never '
+  + 'delegate a question back to `library_ask`, which is the callers\' entry into you. Always '
+  + 'ground statements in the stored documents and cite them inline as [name] after each '
+  + 'claim, exactly matching the resource names; when the library holds nothing relevant, say '
+  + 'so plainly instead of guessing.'
 
 /** Schemastery configuration for the librarian subagent backend. */
 export const Config: z<Config> = z.object({

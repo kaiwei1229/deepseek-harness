@@ -1,4 +1,4 @@
-import { readFile } from 'node:fs/promises'
+import { readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { setupHarness, type TestHarness } from './helpers.ts'
@@ -127,5 +127,94 @@ describe('LibrarianService', () => {
     await expect(ctx.librarian.deleteResource(resource.id)).resolves.toBe(true)
     await expect(ctx.librarian.deleteResource(resource.id)).resolves.toBe(false)
     expect(ctx.librarian.listResources(notebook.id)).toEqual([])
+  })
+})
+
+describe('LibrarianService sidecars', () => {
+  it('writes the notebook index at ingest and answers structure and search from it', async () => {
+    const { ctx, root } = await harness()
+    const notebook = await ctx.librarian.createNotebook('kb')
+    const resource = await ctx.librarian.ingest({
+      notebookId: notebook.id,
+      name: 'gl.md',
+      content: { text: '# Fragment\ngl_FragColor sets the pixel color.' },
+    })
+    const indexPath = join(root, 'library', 'v1', notebook.id, 'index.json')
+    const written = JSON.parse(await readFile(indexPath, 'utf8')) as {
+      resources: { resourceId: string; summary: string; chunks: { terms: Record<string, number> }[] }[]
+    }
+    expect(written.resources.map(entry => entry.resourceId)).toEqual([resource.id])
+    expect(written.resources[0]?.summary).toContain('gl_FragColor')
+    // The tokenizer splits at underscores, so gl_FragColor lands as two terms.
+    expect(written.resources[0]?.chunks[0]?.terms['fragcolor']).toBe(1)
+    // Corrupt the converted document: index-served reads must not notice.
+    await writeFile(join(root, 'library', 'v1', notebook.id, 'markdown', `${resource.id}.md`), 'clobbered', 'utf8')
+    const hits = await ctx.librarian.search(notebook.id, 'gl_FragColor pixel', 4)
+    expect(hits[0]?.text).toContain('gl_FragColor sets the pixel color')
+    const structures = await ctx.librarian.structure(notebook.id)
+    expect(structures[0]?.resources[0]?.outline).toEqual(['Fragment'])
+    expect(structures[0]?.resources[0]?.summary).toContain('gl_FragColor')
+  })
+
+  it('rebuilds a missing index on read (self-heal for pre-index notebooks)', async () => {
+    const { ctx, root } = await harness()
+    const notebook = await ctx.librarian.createNotebook('kb')
+    await ctx.librarian.ingest({
+      notebookId: notebook.id,
+      name: 'notes.md',
+      content: { text: '# Shaders\nContent about shaders.' },
+    })
+    const indexPath = join(root, 'library', 'v1', notebook.id, 'index.json')
+    await rm(indexPath)
+    const hits = await ctx.librarian.search(notebook.id, 'shaders', 4)
+    expect(hits[0]?.resourceName).toBe('notes.md')
+    await expect(readFile(indexPath, 'utf8')).resolves.toContain('notes.md')
+  })
+
+  it('rebuilds a stale index after a rename lands on disk', async () => {
+    const { ctx, root } = await harness()
+    const notebook = await ctx.librarian.createNotebook('before')
+    await ctx.librarian.renameNotebook(notebook.id, 'after')
+    await ctx.librarian.structure(notebook.id)
+    const indexPath = join(root, 'library', 'v1', notebook.id, 'index.json')
+    const written = JSON.parse(await readFile(indexPath, 'utf8')) as { title: string }
+    expect(written.title).toBe('after')
+  })
+
+  it('records declined asks and agent exchanges in the durable ask log', async () => {
+    const { ctx } = await harness()
+    const notebook = await ctx.librarian.createNotebook('kb')
+    await ctx.librarian.ask(notebook.id, 'anything at all?')
+    const recorded = await ctx.librarian.recordAsk(notebook.id, {
+      origin: 'agent',
+      question: 'from the chat',
+      answer: 'an answer [notes.md]',
+      grounded: true,
+      sources: [],
+    })
+    expect(recorded.id).not.toBe('')
+    const log = await ctx.librarian.askLog(notebook.id)
+    expect(log.map(entry => entry.origin)).toEqual(['ui', 'agent'])
+    expect(log[0]?.grounded).toBe(false)
+    expect(log[1]?.question).toBe('from the chat')
+    await expect(ctx.librarian.askLog('missing' as never)).rejects.toThrow(/unknown notebook/)
+  })
+
+  it('caps the ask log at its newest 200 entries', async () => {
+    const { ctx } = await harness()
+    const notebook = await ctx.librarian.createNotebook('kb')
+    for (let index = 0; index < 205; index += 1) {
+      await ctx.librarian.recordAsk(notebook.id, {
+        origin: 'agent',
+        question: `q${index}`,
+        answer: 'a',
+        grounded: true,
+        sources: [],
+      })
+    }
+    const log = await ctx.librarian.askLog(notebook.id)
+    expect(log).toHaveLength(200)
+    expect(log[0]?.question).toBe('q5')
+    expect(log.at(-1)?.question).toBe('q204')
   })
 })

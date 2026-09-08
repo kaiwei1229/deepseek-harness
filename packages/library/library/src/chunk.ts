@@ -24,6 +24,16 @@ export interface ScoredChunk extends Chunk {
   score: number
 }
 
+/**
+ * A chunk carrying its precomputed term counts, the shape persisted in the
+ * ingest-time notebook index so query-time scoring never re-tokenizes
+ * documents.
+ */
+export interface CountedChunk extends Chunk {
+  /** Term-frequency map of {@link termsOf} over the chunk text. */
+  terms: Record<string, number>
+}
+
 /** Chunks longer than this are re-split at blank lines. */
 const MAX_CHUNK_CHARS = 1800
 
@@ -102,6 +112,26 @@ export function termsOf(text: string): string[] {
 }
 
 /**
+ * Count {@link termsOf} occurrences in one text.
+ * @param text - Source text.
+ * @returns a plain term-frequency record, JSON-safe for the notebook index.
+ */
+export function countTerms(text: string): Record<string, number> {
+  const counts: Record<string, number> = Object.create(null) as Record<string, number>
+  for (const term of termsOf(text)) counts[term] = (counts[term] ?? 0) + 1
+  return counts
+}
+
+/**
+ * Attach precomputed term counts to one chunk.
+ * @param chunk - The chunk to count.
+ * @returns the same chunk fields plus its term-frequency map.
+ */
+export function withTermCounts(chunk: Chunk): CountedChunk {
+  return { ...chunk, terms: countTerms(chunk.text) }
+}
+
+/**
  * Score chunks against a query with TF-IDF weighting: each query term
  * contributes its in-chunk frequency times a rarity weight, and totals are
  * dampened by chunk length so long chunks do not dominate.
@@ -111,25 +141,37 @@ export function termsOf(text: string): string[] {
  * @returns the highest-scoring chunks in descending score order, excluding zero scores.
  */
 export function scoreChunks(chunks: readonly Chunk[], query: string, limit: number): ScoredChunk[] {
+  return scoreCountedChunks(chunks.map(withTermCounts), query, limit)
+}
+
+/**
+ * Score pre-counted chunks against a query — the query-time half of
+ * {@link scoreChunks}, fed from the ingest-time notebook index so a search
+ * neither re-reads nor re-tokenizes documents.
+ * @param chunks - Candidate chunks with their term counts.
+ * @param query - Natural-language query.
+ * @param limit - Maximum number of results.
+ * @returns the highest-scoring chunks in descending score order, excluding zero scores.
+ */
+export function scoreCountedChunks(chunks: readonly CountedChunk[], query: string, limit: number): ScoredChunk[] {
   const queryTerms = [...new Set(termsOf(query))]
   if (queryTerms.length === 0 || chunks.length === 0) return []
-  const chunkTerms = chunks.map((chunk) => {
-    const counts = new Map<string, number>()
-    for (const term of termsOf(chunk.text)) counts.set(term, (counts.get(term) ?? 0) + 1)
-    return counts
-  })
+  const documentFrequencies = new Map<string, number>()
+  for (const term of queryTerms) {
+    documentFrequencies.set(term, chunks.reduce((total, chunk) => total + (Object.hasOwn(chunk.terms, term) ? 1 : 0), 0))
+  }
   const scored: ScoredChunk[] = []
-  for (const [index, chunk] of chunks.entries()) {
-    const counts = chunkTerms[index]
-    if (!counts) continue
+  for (const chunk of chunks) {
     let score = 0
     for (const term of queryTerms) {
-      const frequency = counts.get(term)
-      if (!frequency) continue
-      const documentFrequency = chunkTerms.reduce((total, other) => total + (other.has(term) ? 1 : 0), 0)
-      score += frequency * (1 + Math.log(chunks.length / (1 + documentFrequency)))
+      const frequency = Object.hasOwn(chunk.terms, term) ? chunk.terms[term] : undefined
+      if (frequency === undefined || frequency === 0) continue
+      score += frequency * (1 + Math.log(chunks.length / (1 + (documentFrequencies.get(term) ?? 0))))
     }
-    if (score > 0) scored.push({ ...chunk, score: score / Math.sqrt(1 + chunk.text.length / 100) })
+    if (score > 0) {
+      const { resourceId, resourceName, heading, text } = chunk
+      scored.push({ resourceId, resourceName, heading, text, score: score / Math.sqrt(1 + text.length / 100) })
+    }
   }
   return scored.sort((left, right) => right.score - left.score).slice(0, limit)
 }

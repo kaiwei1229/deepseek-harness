@@ -20,15 +20,26 @@ import { BlockAssembler, createUserMessage } from '@deepseek-ai/dsh-llm'
 import type { GenerateOptions, Message } from '@deepseek-ai/dsh-llm'
 // Type-only: resolves ctx.agentDefaultModel for the ask-time route fallback.
 import type {} from '@deepseek-ai/dsh-agent-default-model'
-import { chunkMarkdown, outlineOf, scoreChunks } from './chunk.ts'
-import type { Chunk, ScoredChunk } from './chunk.ts'
+import { chunkMarkdown, outlineOf, scoreCountedChunks, withTermCounts } from './chunk.ts'
+import type { CountedChunk, ScoredChunk } from './chunk.ts'
 import { builtinTextConverter } from './convert/builtin.ts'
 import { markitdownConverter } from './convert/markitdown.ts'
 import type { ConvertInput, LibraryConverter } from './convert/types.ts'
 import { libraryDomainSpec } from './spec.ts'
 import type { NotebookRecord, ResourceRecord } from './spec.ts'
+import {
+  ASK_LOG_FILE,
+  ASK_LOG_LIMIT,
+  INDEX_FILE,
+  SUMMARY_CHARS,
+  askLog as askLogSchema,
+  notebookIndex as notebookIndexSchema,
+} from './sidecars.ts'
+import type { AskLog, IndexedResource, NotebookIndex } from './sidecars.ts'
 import { mediaTypeOf } from './types.ts'
 import type {
+  AskLogEntry,
+  AskOrigin,
   AskResult,
   AskSource,
   IngestRequest,
@@ -39,8 +50,10 @@ import type {
   ResourceId,
 } from './types.ts'
 
-export { chunkMarkdown, outlineOf, scoreChunks, termsOf } from './chunk.ts'
-export type { Chunk, ScoredChunk } from './chunk.ts'
+export { chunkMarkdown, countTerms, outlineOf, scoreChunks, scoreCountedChunks, termsOf, withTermCounts } from './chunk.ts'
+export type { Chunk, CountedChunk, ScoredChunk } from './chunk.ts'
+export { ASK_LOG_FILE, ASK_LOG_LIMIT, INDEX_FILE, SUMMARY_CHARS } from './sidecars.ts'
+export type { AskLog, IndexedResource, NotebookIndex } from './sidecars.ts'
 export { builtinTextConverter, htmlToMarkdown } from './convert/builtin.ts'
 export { markitdownConverter } from './convert/markitdown.ts'
 export type { ConvertInput, LibraryConverter } from './convert/types.ts'
@@ -125,7 +138,7 @@ const byCreatedDesc = <T extends { readonly createdAt: string; readonly id: stri
   left: T,
   right: T,
 ): number =>
-  right.createdAt.localeCompare(left.createdAt) || String(left.id).localeCompare(String(right.id))
+  right.createdAt.localeCompare(left.createdAt) || left.id.localeCompare(right.id)
 
 /** Directory holding original uploads inside one notebook directory. */
 const ORIGINAL_DIR = 'original'
@@ -198,7 +211,7 @@ export class LibrarianService extends Service {
    * @returns the disposer that removes it.
    */
   registerConverter(converter: LibraryConverter): () => void {
-    return this.ctx.effect(() => {
+    const dispose = this.ctx.effect(() => {
       this.converters.push(converter)
       this.converters.sort((left, right) => right.priority - left.priority)
       return () => {
@@ -206,6 +219,8 @@ export class LibrarianService extends Service {
         if (index >= 0) this.converters.splice(index, 1)
       }
     }, `library.converter:${converter.id}`)
+    // The effect disposer resolves a promise; the seam's disposer is void.
+    return () => { void dispose() }
   }
 
   /**
@@ -240,6 +255,7 @@ export class LibrarianService extends Service {
     await this.requireNotebooks().put(id, record)
     await mkdir(join(this.root, id, ORIGINAL_DIR), { recursive: true })
     await mkdir(join(this.root, id, MARKDOWN_DIR), { recursive: true })
+    await this.rebuildIndex(id)
     return snapshotNotebook(id, record)
   }
 
@@ -310,6 +326,9 @@ export class LibrarianService extends Service {
     if (record.markdownFile !== undefined) {
       await rm(join(this.root, record.notebookId, MARKDOWN_DIR, record.markdownFile), { force: true })
     }
+    if (this.requireNotebooks().get(record.notebookId) !== undefined) {
+      await this.rebuildIndex(record.notebookId)
+    }
     return true
   }
 
@@ -354,7 +373,11 @@ export class LibrarianService extends Service {
     }
     await this.requireResources().put(id, record)
     await this.touchNotebook(request.notebookId)
-    return await this.convert(id, record, originalPath)
+    const settled = await this.convert(id, record, originalPath)
+    // The write-side index duty: every ingest leaves a fresh structure/search
+    // index beside the documents, so reads never pay for the maintenance.
+    await this.rebuildIndex(request.notebookId)
+    return settled
   }
 
   /**
@@ -386,8 +409,10 @@ export class LibrarianService extends Service {
   }
 
   /**
-   * Structure listing across notebooks: every notebook with its resources and
-   * their leading Markdown headings — the librarian's navigation answer.
+   * Structure listing across notebooks: every notebook with its resources,
+   * their leading Markdown headings, and a leading excerpt — the librarian's
+   * navigation answer, read from the ingest-time index rather than the
+   * documents.
    * @param notebookId - Restrict to one notebook; omitted lists all.
    * @returns notebook structures, newest notebook first.
    */
@@ -397,35 +422,29 @@ export class LibrarianService extends Service {
       : this.listNotebooks().filter(notebook => notebook.id === notebookId)
     const structures: NotebookStructure[] = []
     for (const notebook of notebooks) {
-      const resources = []
-      for (const resource of this.listResources(notebook.id)) {
-        resources.push({
-          resourceId: resource.id,
-          name: resource.name,
-          kind: resource.kind,
-          status: resource.status,
-          outline: resource.status === 'ready' ? outlineOf(await this.readMarkdown(resource.id), 12) : [],
-        })
-      }
-      structures.push({ notebookId: notebook.id, title: notebook.title, resources })
+      const index = await this.readIndex(notebook.id)
+      structures.push({
+        notebookId: notebook.id,
+        title: notebook.title,
+        resources: index.resources.map(({ resourceId, name, kind, status, outline, summary }) =>
+          ({ resourceId, name, kind, status, outline, summary })),
+      })
     }
     return structures
   }
 
   /**
    * Retrieve the most relevant converted-Markdown chunks of one notebook.
+   * Chunks and term counts come from the ingest-time index, so one search
+   * costs one index read plus scoring — no document reads or re-tokenizing.
    * @param notebookId - Notebook to search.
    * @param query - Natural-language query.
    * @param limit - Maximum chunks returned.
    * @returns scored chunks, best first; empty when nothing matches.
    */
   async search(notebookId: NotebookId, query: string, limit: number): Promise<ScoredChunk[]> {
-    const chunks: Chunk[] = []
-    for (const resource of this.listResources(notebookId)) {
-      if (resource.status !== 'ready') continue
-      chunks.push(...chunkMarkdown(String(resource.id), resource.name, await this.readMarkdown(resource.id)))
-    }
-    return scoreChunks(chunks, query, limit)
+    const index = await this.readIndex(notebookId)
+    return scoreCountedChunks(indexChunks(index), query, limit)
   }
 
   /**
@@ -434,24 +453,28 @@ export class LibrarianService extends Service {
    * inline citations. A question with no keyword match (an overview ask like
    * "introduce this") falls back to each document's leading content, so it
    * still answers grounded; only a notebook with no readable content declines
-   * (`grounded: false`) without a model call.
+   * (`grounded: false`) without a model call. Every settled exchange is
+   * appended to the notebook's durable ask log.
    * @param notebookId - Notebook to answer from.
    * @param question - Natural-language question.
    * @param signal - Optional caller cancellation.
+   * @param origin - Who asked, recorded in the log; defaults to the page (`ui`).
    * @returns the grounded answer with its excerpt provenance.
    */
-  async ask(notebookId: NotebookId, question: string, signal?: AbortSignal): Promise<AskResult> {
+  async ask(notebookId: NotebookId, question: string, signal?: AbortSignal, origin: AskOrigin = 'ui'): Promise<AskResult> {
     if (this.requireNotebooks().get(notebookId) === undefined) {
       throw new Error(`unknown notebook '${notebookId}'`)
     }
     let excerpts = await this.search(notebookId, question, this.config.searchLimit)
     if (excerpts.length === 0) excerpts = await this.leadingExcerpts(notebookId)
     if (excerpts.length === 0) {
-      return {
+      const declined: AskResult = {
         answer: 'This notebook has no readable content yet — add a document first.',
         sources: [],
         grounded: false,
       }
+      await this.recordAsk(notebookId, { origin, question, ...declined })
+      return declined
     }
     const llm = this.ctx.get('llm')
     if (llm === undefined) throw new Error('librarian ask requires the llm service; none is mounted')
@@ -501,7 +524,44 @@ export class LibrarianService extends Service {
       if (sources.some(source => String(source.resourceId) === excerpt.resourceId && source.heading === excerpt.heading)) continue
       sources.push({ resourceId: ResourceId(excerpt.resourceId), name: excerpt.resourceName, heading: excerpt.heading })
     }
-    return { answer, sources, grounded: true }
+    const result: AskResult = { answer, sources, grounded: true }
+    await this.recordAsk(notebookId, { origin, question, ...result })
+    return result
+  }
+
+  /**
+   * Read one notebook's ask history, oldest first.
+   * @param notebookId - Notebook whose log to read.
+   * @returns recorded exchanges; empty for a notebook never asked.
+   */
+  async askLog(notebookId: NotebookId): Promise<AskLogEntry[]> {
+    if (this.requireNotebooks().get(notebookId) === undefined) {
+      throw new Error(`unknown notebook '${notebookId}'`)
+    }
+    return [...(await this.readAskLog(notebookId)).entries]
+  }
+
+  /**
+   * Append one settled exchange to a notebook's durable ask log. `ask` calls
+   * this for the direct route; the `library_ask` tool calls it for
+   * subagent-answered questions so agent asks land in the same history the
+   * Library page shows.
+   * @param notebookId - Notebook the question was asked of.
+   * @param exchange - Origin, question, and the settled answer.
+   * @returns the recorded entry with its id and instant.
+   */
+  async recordAsk(
+    notebookId: NotebookId,
+    exchange: Omit<AskLogEntry, 'id' | 'createdAt'>,
+  ): Promise<AskLogEntry> {
+    if (this.requireNotebooks().get(notebookId) === undefined) {
+      throw new Error(`unknown notebook '${notebookId}'`)
+    }
+    const entry: AskLogEntry = { ...exchange, id: randomUUID(), createdAt: new Date().toISOString() }
+    const log = await this.readAskLog(notebookId)
+    const entries = [...log.entries, entry].slice(-ASK_LOG_LIMIT)
+    await writeFile(this.askLogPath(notebookId), JSON.stringify({ version: 1, entries }), 'utf8')
+    return entry
   }
 
   /**
@@ -509,11 +569,18 @@ export class LibrarianService extends Service {
    * of every ready resource, in listing order, capped at the search limit.
    */
   private async leadingExcerpts(notebookId: NotebookId): Promise<ScoredChunk[]> {
+    const index = await this.readIndex(notebookId)
     const excerpts: ScoredChunk[] = []
-    for (const resource of this.listResources(notebookId)) {
-      if (resource.status !== 'ready') continue
-      const chunks = chunkMarkdown(String(resource.id), resource.name, await this.readMarkdown(resource.id))
-      for (const chunk of chunks.slice(0, 2)) excerpts.push({ ...chunk, score: 0 })
+    for (const resource of index.resources) {
+      for (const chunk of resource.chunks.slice(0, 2)) {
+        excerpts.push({
+          resourceId: String(resource.resourceId),
+          resourceName: resource.name,
+          heading: chunk.heading,
+          text: chunk.text,
+          score: 0,
+        })
+      }
       if (excerpts.length >= this.config.searchLimit) break
     }
     return excerpts.slice(0, this.config.searchLimit)
@@ -568,6 +635,100 @@ export class LibrarianService extends Service {
     await this.requireNotebooks().update(id, current => ({ ...current, updatedAt: new Date().toISOString() }))
   }
 
+  /** Absolute path of one notebook's ingest-time index file. */
+  private indexPath(id: NotebookId): string {
+    return join(this.root, id, INDEX_FILE)
+  }
+
+  /** Absolute path of one notebook's ask-log file. */
+  private askLogPath(id: NotebookId): string {
+    return join(this.root, id, ASK_LOG_FILE)
+  }
+
+  /**
+   * Rebuild and persist one notebook's index from its records and converted
+   * Markdown — the write-side structure/index duty, run at every content
+   * mutation so reads and searches stay cheap.
+   * @param id - Notebook to index.
+   * @returns the fresh index.
+   */
+  private async rebuildIndex(id: NotebookId): Promise<NotebookIndex> {
+    const notebook = this.requireNotebooks().get(id)
+    if (notebook === undefined) throw new Error(`unknown notebook '${id}'`)
+    const resources: IndexedResource[] = []
+    for (const resource of this.listResources(id)) {
+      if (resource.status !== 'ready') {
+        resources.push({
+          resourceId: resource.id,
+          name: resource.name,
+          kind: resource.kind,
+          status: resource.status,
+          outline: [],
+          summary: '',
+          chunks: [],
+        })
+        continue
+      }
+      const markdown = await this.readMarkdown(resource.id)
+      resources.push({
+        resourceId: resource.id,
+        name: resource.name,
+        kind: resource.kind,
+        status: resource.status,
+        outline: outlineOf(markdown, 12),
+        summary: summaryOf(markdown),
+        chunks: chunkMarkdown(String(resource.id), resource.name, markdown)
+          .map(chunk => ({ heading: chunk.heading, text: chunk.text, terms: withTermCounts(chunk).terms })),
+      })
+    }
+    const index: NotebookIndex = { version: 1, title: notebook.title, updatedAt: new Date().toISOString(), resources }
+    await writeFile(this.indexPath(id), JSON.stringify(index), 'utf8')
+    return index
+  }
+
+  /**
+   * Read one notebook's index, rebuilding a missing, unreadable, or stale
+   * file — so notebooks predating the index (or touched by hand) self-heal on
+   * first read while the maintained path stays one file read.
+   * @param id - Notebook whose index to read.
+   * @returns the current index.
+   */
+  private async readIndex(id: NotebookId): Promise<NotebookIndex> {
+    let parsed: NotebookIndex | undefined
+    try {
+      parsed = notebookIndexSchema.parse(JSON.parse(await readFile(this.indexPath(id), 'utf8')))
+    } catch {
+      parsed = undefined
+    }
+    if (parsed !== undefined && !this.indexIsStale(id, parsed)) return parsed
+    return await this.rebuildIndex(id)
+  }
+
+  /** Whether one parsed index no longer matches the durable records. */
+  private indexIsStale(id: NotebookId, index: NotebookIndex): boolean {
+    const notebook = this.requireNotebooks().get(id)
+    if (notebook === undefined || index.title !== notebook.title) return true
+    const records = this.listResources(id)
+    if (records.length !== index.resources.length) return true
+    const indexed = new Map(index.resources.map(resource => [String(resource.resourceId), resource]))
+    return records.some((record) => {
+      const entry = indexed.get(String(record.id))
+      return entry === undefined
+        || entry.status !== record.status
+        || entry.name !== record.name
+        || entry.kind !== record.kind
+    })
+  }
+
+  /** Read one notebook's ask log; a missing or invalid file reads as empty. */
+  private async readAskLog(id: NotebookId): Promise<AskLog> {
+    try {
+      return askLogSchema.parse(JSON.parse(await readFile(this.askLogPath(id), 'utf8')))
+    } catch {
+      return { version: 1, entries: [] }
+    }
+  }
+
   private requireResource(id: ResourceId): ResourceRecord {
     const record = this.requireResources().get(id)
     if (record === undefined) throw new Error(`unknown resource '${id}'`)
@@ -583,6 +744,40 @@ export class LibrarianService extends Service {
     if (this.resourcesTable === undefined) throw new Error('the library is not started yet')
     return this.resourcesTable
   }
+}
+
+/**
+ * Leading plain-text excerpt of one converted document for the index summary:
+ * heading markers and emphasis punctuation stripped, whitespace collapsed.
+ * @param markdown - Converted Markdown content.
+ * @returns at most {@link SUMMARY_CHARS} characters.
+ */
+function summaryOf(markdown: string): string {
+  const plain = markdown
+    .replace(/^#{1,6}\s+/gm, '')
+    // Emphasis and table punctuation only — underscores stay because they are
+    // part of identifiers (gl_FragColor) far more often than emphasis here.
+    .replace(/[*`>|]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+  return plain.length <= SUMMARY_CHARS ? plain : `${plain.slice(0, SUMMARY_CHARS)}…`
+}
+
+/** Flatten one index into counted chunks in listing order. */
+function indexChunks(index: NotebookIndex): CountedChunk[] {
+  const chunks: CountedChunk[] = []
+  for (const resource of index.resources) {
+    for (const chunk of resource.chunks) {
+      chunks.push({
+        resourceId: String(resource.resourceId),
+        resourceName: resource.name,
+        heading: chunk.heading,
+        text: chunk.text,
+        terms: chunk.terms,
+      })
+    }
+  }
+  return chunks
 }
 
 function snapshotNotebook(id: NotebookId, record: NotebookRecord): Notebook {

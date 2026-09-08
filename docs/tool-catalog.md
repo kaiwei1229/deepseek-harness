@@ -1039,7 +1039,7 @@ create, edit, pause, and resume require direct-human root authority; complete an
 
 ### `library_ask`
 
-Ask the Library (the research knowledge base) a question and get an answer grounded in the stored documents, with inline [source] citations. This is the primary way to use the knowledge base — prefer one good question over reading files one by one. Overview questions answer from each document's leading content; only an empty notebook declines.
+Ask the Library (the research knowledge base) a question and get an answer grounded in the stored documents, with inline [source] citations. This is the primary way to use the knowledge base — prefer one good question over reading files one by one. The question is answered by the librarian agent reading the notebook; only an empty notebook declines.
 
 ```json
 {
@@ -1124,7 +1124,7 @@ Source: [`packages/library/tool-library/src/index.ts`](../packages/library/tool-
 
 ### `library_structure`
 
-List the Library structure: every notebook (id and title) with its resources and their leading Markdown headings. Use this to discover what the knowledge base holds before asking or reading.
+List the Library structure: every notebook (id and title) with its resources, their leading Markdown headings, and a leading excerpt — served from the ingest-time index. Use this to discover what the knowledge base holds before asking or reading.
 
 ```json
 {
