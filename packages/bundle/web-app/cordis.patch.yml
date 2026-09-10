@@ -206,6 +206,20 @@
     - id: api-remotes
       name: '@deepseek-ai/dsh-api-remotes'
 
+    # Library capability: the librarian knowledge base (notebooks, document
+    # conversion, grounded answers), the library_* model-facing tools, the
+    # librarian subagent, and the browser Remote/data-plane surface. The whole
+    # family lives in this layer because the librarian's durable registry needs
+    # `storageDomain`, which the base layer does not compose.
+    - id: library
+      name: '@deepseek-ai/dsh-library'
+
+    - id: tool-library
+      name: '@deepseek-ai/dsh-tool-library'
+
+    - id: agent-librarian
+      name: '@deepseek-ai/dsh-agent-librarian'
+
     - id: library-api
       name: '@deepseek-ai/dsh-library-api'
 

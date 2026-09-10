@@ -1065,9 +1065,6 @@ importers:
       '@deepseek-ai/dsh-agent-instructions':
         specifier: workspace:^
         version: link:../../context/agent-instructions
-      '@deepseek-ai/dsh-agent-librarian':
-        specifier: workspace:^
-        version: link:../../library/agent-librarian
       '@deepseek-ai/dsh-agent-loop':
         specifier: workspace:^
         version: link:../../core/agent-loop
@@ -1119,9 +1116,6 @@ importers:
       '@deepseek-ai/dsh-jobs-local':
         specifier: workspace:^
         version: link:../../jobs/jobs-local
-      '@deepseek-ai/dsh-library':
-        specifier: workspace:^
-        version: link:../../library/library
       '@deepseek-ai/dsh-llm':
         specifier: workspace:^
         version: link:../../llm/llm
@@ -1233,9 +1227,6 @@ importers:
       '@deepseek-ai/dsh-tool-jobs':
         specifier: workspace:^
         version: link:../../jobs/tool-jobs
-      '@deepseek-ai/dsh-tool-library':
-        specifier: workspace:^
-        version: link:../../library/tool-library
       '@deepseek-ai/dsh-tool-pwsh':
         specifier: workspace:^
         version: link:../../shell/tool-pwsh
@@ -1371,6 +1362,9 @@ importers:
 
   packages/bundle/web-app:
     dependencies:
+      '@deepseek-ai/dsh-agent-librarian':
+        specifier: workspace:^
+        version: link:../../library/agent-librarian
       '@deepseek-ai/dsh-agent-presets':
         specifier: workspace:^
         version: link:../../preset/agent-presets
@@ -1527,6 +1521,9 @@ importers:
       '@deepseek-ai/dsh-host-webserver':
         specifier: workspace:^
         version: link:../../host/webserver
+      '@deepseek-ai/dsh-library':
+        specifier: workspace:^
+        version: link:../../library/library
       '@deepseek-ai/dsh-library-api':
         specifier: workspace:^
         version: link:../../library/library-api
@@ -1551,6 +1548,9 @@ importers:
       '@deepseek-ai/dsh-storage-json':
         specifier: workspace:^
         version: link:../../storage/storage-json
+      '@deepseek-ai/dsh-tool-library':
+        specifier: workspace:^
+        version: link:../../library/tool-library
       '@deepseek-ai/dsh-web-frontend':
         specifier: workspace:^
         version: link:../../../apps/web
